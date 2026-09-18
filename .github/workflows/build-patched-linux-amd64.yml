@@ -1,0 +1,47 @@
+name: build-patched-linux-amd64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test patched handlers
+        run: go test ./sdk/api/handlers/openai ./sdk/api/handlers
+
+      - name: Build portable Linux AMD64 binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          version="7.3.4-heartbeat.1"
+          commit="$(git rev-parse --short HEAD)"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+            -ldflags="-s -w -X main.Version=${version} -X main.Commit=${commit} -X main.BuildDate=${build_date}" \
+            -o dist/CLIProxyAPI ./cmd/server/
+          file dist/CLIProxyAPI
+          sha256sum dist/CLIProxyAPI > dist/CLIProxyAPI.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CLIProxyAPI-v7.3.4-heartbeat.1-linux-amd64
+          path: |
+            dist/CLIProxyAPI
+            dist/CLIProxyAPI.sha256
+          if-no-files-found: error
+          retention-days: 30

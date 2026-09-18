@@ -9,8 +9,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
@@ -100,4 +102,28 @@ func TestChatCompletionsHandlerDoesNotLoseErrorBeforeFirstPayload(t *testing.T) 
 
 func TestCompletionsHandlerDoesNotLoseErrorBeforeFirstPayload(t *testing.T) {
 	runOpenAIStreamErrorTest(t, "/v1/completions", `{"model":"initial-failure-chat-model","prompt":"hi","stream":true}`)
+}
+
+func TestWaitForInitialStreamEventReleasesHeartbeatBeforeFirstPayload(t *testing.T) {
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage)
+	heartbeat := make(chan time.Time, 1)
+	heartbeat <- time.Unix(1, 0)
+
+	event := waitForInitialStreamEvent(context.Background(), data, errs, heartbeat)
+	if event.kind != initialStreamHeartbeat {
+		t.Fatalf("waitForInitialStreamEvent() kind = %d, want heartbeat", event.kind)
+	}
+}
+
+func TestWaitForInitialStreamEventKeepsImmediateErrorsAsHTTPFailures(t *testing.T) {
+	data := make(chan []byte)
+	errs := make(chan *interfaces.ErrorMessage, 1)
+	want := &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errors.New("initial failure")}
+	errs <- want
+
+	event := waitForInitialStreamEvent(context.Background(), data, errs, nil)
+	if event.kind != initialStreamError || event.err != want {
+		t.Fatalf("waitForInitialStreamEvent() = %#v, want initial error %#v", event, want)
+	}
 }
