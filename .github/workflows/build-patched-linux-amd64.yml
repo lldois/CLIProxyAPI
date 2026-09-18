@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -45,3 +45,17 @@ jobs:
             dist/CLIProxyAPI.sha256
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish release asset for VPS download
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v7.3.4-heartbeat.1"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --target "$GITHUB_SHA" \
+              --title "CLIProxyAPI v7.3.4 heartbeat.1" \
+              --notes "OpenAI streaming keepalive before the first upstream chunk; built for Ubuntu 24.04 amd64 with CGO/plugin support."
+          fi
+          gh release upload "$tag" dist/CLIProxyAPI dist/CLIProxyAPI.sha256 --clobber
