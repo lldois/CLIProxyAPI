@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -21,8 +22,92 @@ import (
 )
 
 const (
-	initialFailureChatModel = "initial-failure-chat-model"
+	initialFailureChatModel   = "initial-failure-chat-model"
+	initialHeartbeatChatModel = "initial-heartbeat-chat-model"
 )
+
+type delayedInitialStreamExecutor struct{}
+
+func (*delayedInitialStreamExecutor) Identifier() string { return "delayed-initial-stream-executor" }
+
+func (*delayedInitialStreamExecutor) Execute(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (*delayedInitialStreamExecutor) ExecuteStream(ctx context.Context, _ *coreauth.Auth, _ coreexecutor.Request, _ coreexecutor.Options) (*coreexecutor.StreamResult, error) {
+	chunks := make(chan coreexecutor.StreamChunk)
+	go func() {
+		defer close(chunks)
+		timer := time.NewTimer(1600 * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		select {
+		case <-ctx.Done():
+		case chunks <- coreexecutor.StreamChunk{Payload: []byte(`{"id":"delayed","choices":[{"delta":{"content":"hello"}}]}`)}:
+		}
+	}()
+	return &coreexecutor.StreamResult{Chunks: chunks}, nil
+}
+
+func (*delayedInitialStreamExecutor) Refresh(_ context.Context, auth *coreauth.Auth) (*coreauth.Auth, error) {
+	return auth, nil
+}
+
+func (*delayedInitialStreamExecutor) CountTokens(context.Context, *coreauth.Auth, coreexecutor.Request, coreexecutor.Options) (coreexecutor.Response, error) {
+	return coreexecutor.Response{}, errors.New("not implemented")
+}
+
+func (*delayedInitialStreamExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
+	return nil, errors.New("not implemented")
+}
+
+type synchronizedResponseWriter struct {
+	header http.Header
+	mu     sync.Mutex
+	status int
+	body   bytes.Buffer
+}
+
+func newSynchronizedResponseWriter() *synchronizedResponseWriter {
+	return &synchronizedResponseWriter{header: make(http.Header)}
+}
+
+func (w *synchronizedResponseWriter) Header() http.Header { return w.header }
+
+func (w *synchronizedResponseWriter) WriteHeader(status int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.status == 0 {
+		w.status = status
+	}
+}
+
+func (w *synchronizedResponseWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.body.Write(p)
+}
+
+func (w *synchronizedResponseWriter) Flush() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+}
+
+func (w *synchronizedResponseWriter) snapshot() (int, string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.status, w.body.String()
+}
 
 type initialFailureStreamExecutor struct{}
 
@@ -125,5 +210,62 @@ func TestWaitForInitialStreamEventKeepsImmediateErrorsAsHTTPFailures(t *testing.
 	event := waitForInitialStreamEvent(context.Background(), data, errs, nil)
 	if event.kind != initialStreamError || event.err != want {
 		t.Fatalf("waitForInitialStreamEvent() = %#v, want initial error %#v", event, want)
+	}
+}
+
+func TestChatCompletionsHandlerWritesHeartbeatBeforeDelayedFirstPayload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	executor := &delayedInitialStreamExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+	auth := &coreauth.Auth{ID: "initial-heartbeat-auth", Provider: executor.Identifier(), Status: coreauth.StatusActive}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	registry.GetGlobalRegistry().RegisterClient(auth.ID, auth.Provider, []*registry.ModelInfo{{ID: initialHeartbeatChatModel}})
+	defer registry.GetGlobalRegistry().UnregisterClient(auth.ID)
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{
+		Streaming: sdkconfig.StreamingConfig{KeepAliveSeconds: 1},
+	}, manager)
+	h := NewOpenAIAPIHandler(base)
+	router := gin.New()
+	router.POST("/v1/chat/completions", h.ChatCompletions)
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"initial-heartbeat-chat-model","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+	request.Header.Set("Content-Type", "application/json")
+	writer := newSynchronizedResponseWriter()
+	done := make(chan struct{})
+	go func() {
+		router.ServeHTTP(writer, request)
+		close(done)
+	}()
+
+	heartbeatDeadline := time.NewTimer(1500 * time.Millisecond)
+	defer heartbeatDeadline.Stop()
+	heartbeatSeen := false
+	for !heartbeatSeen {
+		_, body := writer.snapshot()
+		heartbeatSeen = strings.Contains(body, ": keep-alive\n\n")
+		if heartbeatSeen {
+			break
+		}
+		select {
+		case <-heartbeatDeadline.C:
+			t.Fatal("stream did not emit a heartbeat before the delayed first payload")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("stream did not finish after delayed first payload")
+	}
+	status, body := writer.snapshot()
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%q", status, http.StatusOK, body)
+	}
+	if !strings.Contains(body, `"content":"hello"`) {
+		t.Fatalf("stream body lost delayed payload: %q", body)
 	}
 }

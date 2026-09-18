@@ -47,6 +47,12 @@ type initialStreamEvent struct {
 	errs  <-chan *interfaces.ErrorMessage
 }
 
+type initialStreamExecutionResult struct {
+	data    <-chan []byte
+	headers http.Header
+	errs    <-chan *interfaces.ErrorMessage
+}
+
 func waitForInitialStreamEvent(
 	ctx context.Context,
 	data <-chan []byte,
@@ -529,7 +535,6 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 
 	modelName := gjson.GetBytes(rawJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -538,9 +543,41 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
+	streamReady := make(chan initialStreamExecutionResult, 1)
 	heartbeat, stopHeartbeat := newInitialStreamHeartbeat(handlers.StreamingKeepAliveInterval(h.Cfg))
 	defer stopHeartbeat()
-	initial := waitForInitialStreamEvent(c.Request.Context(), dataChan, errChan, heartbeat)
+	go func() {
+		data, headers, errs := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, h.GetAlt(c))
+		streamReady <- initialStreamExecutionResult{data: data, headers: headers, errs: errs}
+	}()
+
+	var stream initialStreamExecutionResult
+	heartbeatSent := false
+	select {
+	case <-c.Request.Context().Done():
+		cliCancel(c.Request.Context().Err())
+		return
+	case <-heartbeat:
+		setSSEHeaders()
+		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+		flusher.Flush()
+		heartbeatSent = true
+		select {
+		case <-c.Request.Context().Done():
+			cliCancel(c.Request.Context().Err())
+			return
+		case stream = <-streamReady:
+		}
+	case stream = <-streamReady:
+	}
+
+	if heartbeatSent {
+		h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, stream.data, stream.errs)
+		return
+	}
+
+	dataChan, upstreamHeaders, errChan := stream.data, stream.headers, stream.errs
+	initial := waitForInitialStreamEvent(c.Request.Context(), dataChan, errChan, nil)
 	errChan = initial.errs
 
 	switch initial.kind {
@@ -554,13 +591,6 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		} else {
 			cliCancel(nil)
 		}
-		return
-	case initialStreamHeartbeat:
-		setSSEHeaders()
-		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-		flusher.Flush()
-		h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
 		return
 	case initialStreamData:
 		if !initial.ok {
@@ -643,7 +673,6 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 
 	modelName := gjson.GetBytes(chatCompletionsJSON, "model").String()
 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
-	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, chatCompletionsJSON, "")
 
 	setSSEHeaders := func() {
 		c.Header("Content-Type", "text/event-stream")
@@ -652,9 +681,71 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
+	streamReady := make(chan initialStreamExecutionResult, 1)
 	heartbeat, stopHeartbeat := newInitialStreamHeartbeat(handlers.StreamingKeepAliveInterval(h.Cfg))
 	defer stopHeartbeat()
-	initial := waitForInitialStreamEvent(c.Request.Context(), dataChan, errChan, heartbeat)
+	go func() {
+		data, headers, errs := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, chatCompletionsJSON, "")
+		streamReady <- initialStreamExecutionResult{data: data, headers: headers, errs: errs}
+	}()
+
+	var stream initialStreamExecutionResult
+	heartbeatSent := false
+	select {
+	case <-c.Request.Context().Done():
+		cliCancel(c.Request.Context().Err())
+		return
+	case <-heartbeat:
+		setSSEHeaders()
+		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
+		flusher.Flush()
+		heartbeatSent = true
+		select {
+		case <-c.Request.Context().Done():
+			cliCancel(c.Request.Context().Err())
+			return
+		case stream = <-streamReady:
+		}
+	case stream = <-streamReady:
+	}
+
+	if heartbeatSent {
+		dataChan, errChan := stream.data, stream.errs
+		done := make(chan struct{})
+		var doneOnce sync.Once
+		stop := func() { doneOnce.Do(func() { close(done) }) }
+		convertedChan := make(chan []byte)
+		go func() {
+			defer close(convertedChan)
+			for {
+				select {
+				case <-done:
+					return
+				case chunk, ok := <-dataChan:
+					if !ok {
+						return
+					}
+					converted := convertChatCompletionsStreamChunkToCompletions(chunk)
+					if converted == nil {
+						continue
+					}
+					select {
+					case <-done:
+						return
+					case convertedChan <- converted:
+					}
+				}
+			}
+		}()
+		h.handleStreamResult(c, flusher, func(err error) {
+			stop()
+			cliCancel(err)
+		}, convertedChan, errChan)
+		return
+	}
+
+	dataChan, upstreamHeaders, errChan := stream.data, stream.headers, stream.errs
+	initial := waitForInitialStreamEvent(c.Request.Context(), dataChan, errChan, nil)
 	errChan = initial.errs
 
 	if initial.kind == initialStreamCanceled {
@@ -690,10 +781,6 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 
 	setSSEHeaders()
 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
-	if initial.kind == initialStreamHeartbeat {
-		_, _ = c.Writer.Write([]byte(": keep-alive\n\n"))
-		flusher.Flush()
-	}
 	if initial.kind == initialStreamData {
 		converted := convertChatCompletionsStreamChunkToCompletions(initial.chunk)
 		if converted != nil {
