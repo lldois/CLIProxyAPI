@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,7 +22,7 @@ jobs:
       - name: Test patched handlers
         run: go test ./sdk/api/handlers/openai ./sdk/api/handlers
 
-      - name: Build portable Linux AMD64 binary
+      - name: Build Ubuntu 24.04 Linux AMD64 binary with plugin support
         shell: bash
         run: |
           set -euo pipefail
@@ -30,7 +30,7 @@ jobs:
           version="7.3.4-heartbeat.1"
           commit="$(git rev-parse --short HEAD)"
           build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildvcs=false \
             -ldflags="-s -w -X main.Version=${version} -X main.Commit=${commit} -X main.BuildDate=${build_date}" \
             -o dist/CLIProxyAPI ./cmd/server/
           file dist/CLIProxyAPI
@@ -39,7 +39,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: CLIProxyAPI-v7.3.4-heartbeat.1-linux-amd64
+          name: CLIProxyAPI-v7.3.4-heartbeat.1-ubuntu24-amd64
           path: |
             dist/CLIProxyAPI
             dist/CLIProxyAPI.sha256
